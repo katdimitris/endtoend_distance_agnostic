@@ -2,8 +2,7 @@ import numpy as np
 import torch as T
 from utils import PhotonicSigmoid, ClippingReLU
 from channel import Channel_v3
-from nets import Receiver, Transimitter, FiLMTransimitter, DistanceQueryReceiver2, FiLMReceiver, \
-    ReceiverConcatLengthTags, ReceiverTagsPlusFiLM
+from nets import Receiver, Transimitter, FiLMTransimitter, FiLMReceiver
 
 
 def get_channel(parameters):
@@ -51,20 +50,9 @@ def get_receiver(parameters):
                                 min_length=parameters['train_lengths'][0], max_length=parameters['train_lengths'][1],
                                 film_layers=parameters['film_layers'], length_encoding=parameters['length_encoding'],
                                 position=parameters['position'], film_mode=parameters['film_mode'], film_trunk_layers=parameters['mlp_layers'])
-    elif parameters['receiver_type'] == 'tags':
-        receiver = ReceiverConcatLengthTags(n_input=parameters['n'] + n_tags, hidden=2 * parameters['M'], n_output=parameters['M'],
-                                            min_length=parameters['train_lengths'][0], max_length=parameters['train_lengths'][1], step=parameters['step'],
-                                            length_encoding=parameters['length_encoding'], d=parameters['d'], sigma=parameters['sigma'])
     else:
-        receiver = ReceiverTagsPlusFiLM(n_input=parameters['n'] + n_tags, hidden=2 * parameters['M'], n_output=parameters['M'],
-                                        min_length=parameters['train_lengths'][0], max_length=parameters['train_lengths'][1])
-
-    # receiver = DistanceQueryReceiver2(
-    #     n_input=parameters['n'] + n_tags,
-    #     d_model=2 * parameters['M'],
-    #     n_output=parameters['M'],
-    #     L_min=parameters['train_lengths'][0],
-    #     L_max=parameters['train_lengths'][1])
+        raise ValueError(f"Unsupported receiver_type: {parameters['receiver_type']!r} "
+                          f"(expected 'baseline' or 'film')")
 
     return receiver
 
