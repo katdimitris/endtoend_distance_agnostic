@@ -31,7 +31,18 @@ class Channel_v3(T.nn.Module):
             c: float = 3e5,
             N: int = 50 * 127,  #11      Transmitted symbols over the channel
             dtype=T.float,
-            device='cuda:0'):  #dtype=T.double
+            device='cuda:0',  #dtype=T.double
+            full_output=False,  # if True, deserialize all N symbols per group instead of
+                                 # just the center one (see FullDeserializer)
+            sliding=False,  # if True, use stride-1 overlapping windows (SlidingSerializer)
+                             # instead of disjoint N_symbols blocks, so every decoded symbol
+                             # gets real neighbors instead of a fake zero-padded edge. Takes
+                             # precedence over full_output -- every window already has a
+                             # single well-defined center, decoding "all of it" doesn't apply.
+            window_margin=None):  # if set (int), deserialize a window of the center symbol plus
+                                   # this many neighbor symbols on each side (see WindowDeserializer)
+                                   # instead of the center alone -- gives the receiver the neighbor
+                                   # samples that dispersion ISI leaks a symbol's energy into.
 
         super().__init__()
 
@@ -53,8 +64,20 @@ class Channel_v3(T.nn.Module):
         self.dtype = dtype
         self.device = device
 
-        self.serializer = Serializer(N)
-        self.deserializer = Deserializer(N)
+        # serializer/deserializer selection (mutually exclusive modes; sliding wins, then window,
+        # then full, else the default center-only extraction)
+        if sliding:
+            self.serializer = SlidingSerializer(N)
+            self.deserializer = Deserializer(N)
+        elif window_margin is not None:
+            self.serializer = Serializer(N)
+            self.deserializer = WindowDeserializer(N, window_margin)
+        elif full_output:
+            self.serializer = Serializer(N)
+            self.deserializer = FullDeserializer(N)
+        else:
+            self.serializer = Serializer(N)
+            self.deserializer = Deserializer(N)
 
         self.lpf = LPFv3_Sync(fc, band_fact, normalize=True, dtype=dtype)
         self.mzm = MZMv3(ER, normalize=True, dtype=dtype)
@@ -237,6 +260,26 @@ class ExperimentalSerializer(T.nn.Module):
         return x
 
 
+class SlidingSerializer(T.nn.Module):
+    """Like Serializer, but instead of chopping the stream into disjoint blocks of N_symbols
+    (where positions near a block edge get zero-padding as their 'neighbor' during LPF/dispersion,
+    since there's no real adjacent symbol within that isolated block), this builds an overlapping
+    window of N_symbols around every position using its true stream neighbors, stride 1. Row w of
+    the output is real consecutive symbols w..w+N_symbols-1; paired with Deserializer, its center
+    always decodes original stream position w + N_symbols//2 using genuine neighbors on both sides
+    -- only the first and last N_symbols//2 positions of the whole stream lack full context, not
+    N_symbols-1 out of every N_symbols."""
+    def __init__(self, N_symbols=11):
+        super(SlidingSerializer, self).__init__()
+        self.N_symbols = N_symbols
+
+    def __call__(self, x):
+        n_signal = x.size(1)
+        windows = x.unfold(0, self.N_symbols, 1)  # (L-N+1, n_signal, N_symbols)
+        windows = windows.permute(0, 2, 1)  # (L-N+1, N_symbols, n_signal)
+        return windows.reshape(-1, self.N_symbols * n_signal)
+
+
 class Deserializer(T.nn.Module):
     def __init__(
             self,
@@ -253,6 +296,56 @@ class Deserializer(T.nn.Module):
                                                n_signal]
 
         return x.view(-1, n_signal)
+
+
+class FullDeserializer(T.nn.Module):
+    """Like Deserializer, but keeps all N_symbols positions per group instead of just the
+    center one -- inverse reshape of Serializer, splitting each (n_signal*N_symbols)-wide row
+    back into N_symbols separate (n_signal)-wide rows. Every symbol in the block was still
+    filtered/dispersed jointly (so ISI from its neighbors is real), but now every position is
+    returned for decoding instead of only the middle one. Requires targets built to match
+    (one label per position, not one per group) -- see full_targets in utils.get_random_ds."""
+    def __init__(
+            self,
+            N_symbols=11,
+    ):
+        super(FullDeserializer, self).__init__()
+        self.N_symbols = N_symbols
+
+    def __call__(self, x):
+        n_signal = x.size()[1] // self.N_symbols
+        # LPF is applied twice in Channel_v3.forward and each pass grows the sequence by 1
+        # (its padding/kernel-size combo isn't perfectly "same"-preserving), so x is usually a
+        # few columns wider than n_signal*N_symbols by this point. Deserializer never notices
+        # since it only ever slices out one n_signal-wide chunk; reshaping everything here
+        # needs that same usable width made explicit, trimming the same trailing remainder
+        # Deserializer already implicitly ignores.
+        usable = n_signal * self.N_symbols
+        return x[:, :usable].reshape(-1, n_signal)
+
+
+class WindowDeserializer(T.nn.Module):
+    """Returns a window of (2*margin+1) consecutive symbols centered on each group's center symbol,
+    concatenated, instead of only the center one. Chromatic dispersion spreads a symbol's energy
+    into its neighbor positions (ISI, growing with fiber length) -- the center-only Deserializer
+    discards exactly those neighbor samples, so the receiver never sees the leaked energy and can't
+    undo the spread. This hands the receiver center +/- margin symbols so it CAN. Targets stay
+    center-only (custom_collate_fn default), so this only widens the receiver's input; the decoded
+    symbol is still the center one."""
+    def __init__(self, N_symbols=11, margin=2):
+        super(WindowDeserializer, self).__init__()
+        self.N_symbols = N_symbols
+        self.margin = int(margin)
+        if not (0 <= self.margin <= N_symbols // 2):
+            raise ValueError(f"window margin {margin} must be in [0, {N_symbols // 2}] for "
+                              f"N_symbols={N_symbols}")
+
+    def __call__(self, x):
+        n_signal = x.size()[1] // self.N_symbols
+        center = self.N_symbols // 2
+        lo = (center - self.margin) * n_signal
+        hi = (center + self.margin + 1) * n_signal
+        return x[:, lo:hi].reshape(x.size(0), (2 * self.margin + 1) * n_signal)
 
 
 class ExperimentalDeserializer(T.nn.Module):

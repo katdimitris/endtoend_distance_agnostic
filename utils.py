@@ -280,14 +280,19 @@ class OneHotVecGenerator(object):
         return onehot
 
 
-def custom_collate_fn(data, N_symbols):
+def custom_collate_fn(data, N_symbols, full_targets=False):
     batch_size = len(data)
     inputs, targets = zip(*data)
 
-    targets = T.tensor([
-        targets[i]
-        for i in [i for i in range(N_symbols // 2, batch_size, N_symbols)]
-    ])
+    if full_targets:
+        # one target per position (matches FullDeserializer's un-grouped output) instead of
+        # one per N_symbols-group
+        targets = T.tensor(targets)
+    else:
+        targets = T.tensor([
+            targets[i]
+            for i in [i for i in range(N_symbols // 2, batch_size, N_symbols)]
+        ])
 
     inputs = T.stack(list(inputs), dim=0)
 
@@ -295,21 +300,27 @@ def custom_collate_fn(data, N_symbols):
 
 
 class RandomDataset(Dataset):
-    def __init__(self, max_num, N_symbols, device, samples_num, dtype=T.double):
+    def __init__(self, max_num, N_symbols, device, samples_num, dtype=T.double, full_targets=False):
         self.generator = OneHotVecGenerator()
         self.max_num = max_num
         self.samples_num = samples_num
         self.dtype = dtype
         self.N_symbols = N_symbols
+        self.full_targets = full_targets
         self.data = self.generator(max_num, samples_num).to(device)
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, i):
-        return self.generator.convert_to_onehot(
-            self.data[i]), self.data[(i // self.N_symbols) * self.N_symbols +
-                                     (self.N_symbols // 2)].type(T.long)
+        if self.full_targets:
+            # this position's own label, for evaluating every symbol in the group (not just
+            # the center) against FullDeserializer's un-grouped channel output
+            target = self.data[i].type(T.long)
+        else:
+            target = self.data[(i // self.N_symbols) * self.N_symbols +
+                               (self.N_symbols // 2)].type(T.long)
+        return self.generator.convert_to_onehot(self.data[i]), target
 
     def get_onehot(self):
         return self.generator.convert_to_onehot(self.data)
@@ -318,11 +329,21 @@ class RandomDataset(Dataset):
         return self.data
 
 
-def get_random_ds(size, max_num, N_symbols, device, batch_size=64, dtype=T.double):
+def get_random_ds(size, max_num, N_symbols, device, batch_size=64, dtype=T.double, full_targets=False):
+    if batch_size % N_symbols != 0:
+        # custom_collate_fn's center-target selection (and inference.py's per-position
+        # full-mode tracking) both assume every batch starts exactly at a group boundary.
+        # With shuffle=False, batch b starts at global index b*batch_size -- if that isn't a
+        # multiple of N_symbols, the group-boundary phase drifts by a different amount every
+        # batch, and both silently grade the wrong position within each group instead of
+        # raising an error. Failing loudly here beats a batch_size that quietly corrupts results.
+        raise ValueError(f"batch_size ({batch_size}) must be a multiple of N_symbols ({N_symbols}) "
+                          f"-- otherwise which position within each group is 'center' silently "
+                          f"drifts from batch to batch instead of staying fixed.")
     return DataLoader(
-        RandomDataset(max_num, N_symbols, device, size, dtype),
+        RandomDataset(max_num, N_symbols, device, size, dtype, full_targets=full_targets),
         batch_size,
-        collate_fn=lambda data: custom_collate_fn(data, N_symbols),
+        collate_fn=lambda data: custom_collate_fn(data, N_symbols, full_targets=full_targets),
         shuffle=False,
         num_workers=0,
         pin_memory=True,

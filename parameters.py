@@ -2,7 +2,7 @@ import numpy as np
 import torch as T
 from utils import PhotonicSigmoid, ClippingReLU
 from channel import Channel_v3
-from nets import Receiver, Transimitter, FiLMTransimitter, FiLMReceiver
+from nets import Receiver, Transimitter, FiLMTransimitter, FiLMReceiver, EqualizerReceiver
 
 
 def get_channel(parameters):
@@ -21,14 +21,21 @@ def get_channel(parameters):
         parameters['reference_wavelength_nm'],
         2.9979e5,
         parameters['N'],
-        device=parameters['device']
+        device=parameters['device'],
+        full_output=parameters.get('full_eval', False),
+        sliding=parameters.get('sliding_eval', False),
+        window_margin=parameters.get('window_margin', None),
     )
     return channel
 
 def get_transmitter(parameters):
     n_tags = 0
+    # .get() defaults keep old checkpoints (saved before --transmitter_activations existed)
+    # loadable: they get today's previous hardcoded behavior (relu, relu, sigmoid).
+    tx_activations = parameters.get('transmitter_activations', ('relu', 'relu', 'sigmoid'))
     if parameters['transmitter_type'] == 'baseline':
-        transmitter = Transimitter(n_input=parameters['M']+n_tags, hidden=parameters['M'], n_output=parameters['n'])
+        transmitter = Transimitter(n_input=parameters['M']+n_tags, hidden=parameters['M'], n_output=parameters['n'],
+                                   activations=tx_activations, parameters=parameters)
     elif parameters['transmitter_type'] == 'film':
         transmitter = FiLMTransimitter(n_input=parameters['M']+n_tags, hidden=parameters['M'], n_output=parameters['n'],
                                        min_length=parameters['train_lengths'][0],
@@ -36,23 +43,44 @@ def get_transmitter(parameters):
                                        film_layers=parameters['film_layers'],
                                        length_encoding=parameters['length_encoding'],
                                        position=parameters['position'], film_mode=parameters['film_mode'],
-                                       film_trunk_layers=parameters['mlp_layers']
+                                       film_trunk_layers=parameters['mlp_layers'],
+                                       activations=tx_activations, parameters=parameters,
                                        )
     return transmitter
 
 
 def get_receiver(parameters):
     n_tags = 0
+    # .get() default keeps old checkpoints (saved before --receiver_activations existed) loadable.
+    rx_activations = parameters.get('receiver_activations', ('relu', 'relu'))
     if parameters['receiver_type'] == 'baseline':
-        receiver = Receiver(n_input=parameters['n'] + n_tags, hidden=2 * parameters['M'], n_output=parameters['M'])
+        receiver = Receiver(n_input=parameters['n'] + n_tags, hidden=2 * parameters['M'], n_output=parameters['M'],
+                            activations=rx_activations, parameters=parameters)
     elif parameters['receiver_type'] == 'film':
         receiver = FiLMReceiver(n_input=parameters['n'] + n_tags, hidden=2 * parameters['M'], n_output=parameters['M'],
                                 min_length=parameters['train_lengths'][0], max_length=parameters['train_lengths'][1],
                                 film_layers=parameters['film_layers'], length_encoding=parameters['length_encoding'],
-                                position=parameters['position'], film_mode=parameters['film_mode'], film_trunk_layers=parameters['mlp_layers'])
+                                position=parameters['position'], film_mode=parameters['film_mode'], film_trunk_layers=parameters['mlp_layers'],
+                                activations=rx_activations, parameters=parameters)
+    elif parameters['receiver_type'] == 'equalizer':
+        margin = parameters.get('window_margin', 2)
+        # input is the WindowDeserializer's (2*margin+1) symbols wide; each symbol is n samples
+        n_in = (2 * margin + 1) * parameters['n']
+        receiver = EqualizerReceiver(n_input=n_in, hidden=2 * parameters['M'], n_output=parameters['M'],
+                                     min_length=parameters['train_lengths'][0],
+                                     max_length=parameters['train_lengths'][1],
+                                     length_encoding=parameters['length_encoding'],
+                                     rank=parameters.get('rank', 8))
+    elif parameters['receiver_type'] == 'wide':
+        # ablation: wider neighbor-window context but NO length conditioning at all -- a plain
+        # unconditioned MLP receiver on the WindowDeserializer's wide input. Isolates whether the
+        # extra ISI context alone helps, separate from the length-conditioned mixing.
+        margin = parameters.get('window_margin', 2)
+        n_in = (2 * margin + 1) * parameters['n']
+        receiver = Receiver(n_input=n_in, hidden=2 * parameters['M'], n_output=parameters['M'])
     else:
         raise ValueError(f"Unsupported receiver_type: {parameters['receiver_type']!r} "
-                          f"(expected 'baseline' or 'film')")
+                          f"(expected 'baseline', 'film', 'equalizer', or 'wide')")
 
     return receiver
 
@@ -62,7 +90,7 @@ def get_channel_parameters(initializer=None):
     parameters[
         'band_fact'] = 0.01  # Inside LPF_Sync will determine the number of taps and so the filter sharpness
     parameters['snr'] = 38  #   SNR = ENOB*6.02 + 1.76
-    parameters['sample_rate'] = 336e9 * 1.0
+    parameters['sample_rate'] = 320e9 * 1.0 # 336e9 * 1.0
     parameters['fc'] = (
         (32e9) / (parameters['sample_rate'])
     )  # Cutoff frequency as a fraction of the sampling rate
@@ -80,7 +108,7 @@ def get_channel_parameters(initializer=None):
     parameters['p'] = 1
 
     parameters['M'] = 64  # Input length one-hot-vector 64
-    parameters['n'] = 48  # Transmitter output 48
+    parameters['n'] = 40  # Transmitter output 48
 
     # Input of transmitter (11, 64) -> (batch size, one-hot-vector)
     # Output of transmitter (11, 48) -> (batch size, signal)

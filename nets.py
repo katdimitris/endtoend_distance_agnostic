@@ -3,16 +3,41 @@ import torch as T
 import torch.nn as nn
 import math
 
+from utils import PhotonicSigmoid, ClippingReLU
+
+ALLOWED_ACTIVATIONS = ('relu', 'sigmoid', 'photonic_sigmoid', 'cliprelu')
+
+
+def make_activation(name, parameters=None):
+    """Builds an activation module by name. 'cliprelu' needs parameters['enob']/['p'] to compute
+    its clip point (s_q, the ADC/DAC quantization step) -- same formula used historically for
+    this receiver/transmitter pair (s_q = 3*p*10**(-(6.02*enob+1.76)/10)); falls back to enob=6,
+    p=1 (this repo's defaults) if parameters is None."""
+    name = str(name).lower()
+    if name == 'relu':
+        return nn.ReLU()
+    elif name == 'sigmoid':
+        return nn.Sigmoid()
+    elif name == 'photonic_sigmoid':
+        return PhotonicSigmoid()
+    elif name == 'cliprelu':
+        p = parameters.get('p', 1) if parameters else 1
+        enob = parameters.get('enob', 6) if parameters else 6
+        s_q = 3 * p * 10 ** (-(6.02 * enob + 1.76) / 10.0)
+        return ClippingReLU(s_q)
+    else:
+        raise ValueError(f"Unsupported activation {name!r}; expected one of {ALLOWED_ACTIVATIONS}")
+
 
 class Receiver(nn.Module):
-    def __init__(self, n_input=48, hidden=128, n_output=64):
+    def __init__(self, n_input=48, hidden=128, n_output=64, activations=('relu', 'relu'), parameters=None):
         super().__init__()
 
         self.layer_in = nn.Linear(n_input, hidden)
         self.layer_1 = nn.Linear(hidden, hidden)
         self.layer_out = nn.Linear(hidden, n_output)
-        self.act1 = nn.ReLU()
-        self.act2 = nn.ReLU()
+        self.act1 = make_activation(activations[0], parameters)
+        self.act2 = make_activation(activations[1], parameters)
 
     def forward(self, x, length=None):
         x = self.layer_in(x)
@@ -33,21 +58,21 @@ class Receiver(nn.Module):
 
 
 class Transimitter(nn.Module):
-    def __init__(self, n_input=64, hidden=128, n_output=48):
+    def __init__(self, n_input=64, hidden=128, n_output=48, activations=('relu', 'relu', 'sigmoid'), parameters=None):
         super().__init__()
 
         self.layer_in = nn.Linear(n_input, hidden)
         self.layer_1 = nn.Linear(hidden, hidden)
         self.layer_out = nn.Linear(hidden, n_output)
-        self.act = torch.nn.ReLU()
-        # self.act_out = PhotonicSigmoid
-        self.act_out = torch.nn.Sigmoid()
+        self.act1 = make_activation(activations[0], parameters)
+        self.act2 = make_activation(activations[1], parameters)
+        self.act_out = make_activation(activations[2], parameters)
 
     def forward(self, x, lengths):
         x = self.layer_in(x)
-        x = self.act(x)
+        x = self.act1(x)
         x = self.layer_1(x)
-        x = self.act(x)
+        x = self.act2(x)
         x = self.layer_out(x)
         x = self.act_out(x)
 
@@ -75,10 +100,12 @@ class FiLMTransimitter(nn.Module):
         film_mode="both",
         film_trunk_layers=2,
         film_trunk_hidden=None,
+        activations=('relu', 'relu', 'sigmoid'),
+        parameters=None,
     ):
         """
         Same FiLM interface as FiLMReceiver, but keeps the original Transimitter
-        backbone dimensions: 64 -> 128 -> 128 -> 48 with ReLU/ReLU/Sigmoid.
+        backbone dimensions: 64 -> 128 -> 128 -> 48.
         """
         super().__init__()
 
@@ -122,9 +149,9 @@ class FiLMTransimitter(nn.Module):
         self.layer_in = nn.Linear(n_input, hidden)
         self.layer_1 = nn.Linear(hidden, hidden)
         self.layer_out = nn.Linear(hidden, n_output)
-        self.act1 = nn.ReLU()
-        self.act2 = nn.ReLU()
-        self.act_out = nn.Sigmoid()
+        self.act1 = make_activation(activations[0], parameters)
+        self.act2 = make_activation(activations[1], parameters)
+        self.act_out = make_activation(activations[2], parameters)
 
 
         # ----- FiLM trunk (same pattern as receiver) -----
@@ -342,6 +369,8 @@ class FiLMReceiver(nn.Module):
         film_mode="both",
         film_trunk_layers=2,        # <-- NEW: number of Linear layers in the FiLM trunk
         film_trunk_hidden=None,     # <-- NEW (optional): width inside trunk; default=hidden
+        activations=('relu', 'relu'),
+        parameters=None,
     ):
         super().__init__()
 
@@ -375,8 +404,8 @@ class FiLMReceiver(nn.Module):
         self.layer_in = nn.Linear(n_input, hidden)
         self.layer_1 = nn.Linear(hidden, hidden)
         self.layer_out = nn.Linear(hidden, n_output)
-        self.act1 = nn.ReLU()
-        self.act2 = nn.ReLU()
+        self.act1 = make_activation(activations[0], parameters)
+        self.act2 = make_activation(activations[1], parameters)
 
         # ----- Build configurable FiLM trunk -----
         trunk_in_dim = 1 if self.length_encoding == "scalar" else self.num_bins
@@ -540,6 +569,95 @@ class FiLMReceiver(nn.Module):
             out = self._apply_film(out, self.film_head_2(z), 2)
 
         return out
+
+
+class EqualizerReceiver(nn.Module):
+    """Length-agnostic receiver targeting what the distortion diagnosis showed actually matters:
+    chromatic-dispersion ISI is a length-dependent *convolution* (cross-sample mixing), not a
+    per-feature rescale/shift -- so FiLM's beta/gamma condition the wrong axis. This does two
+    things FiLM cannot:
+
+      (1) Length-conditioned MIXING: the first layer weight is W(L) = W0 + U diag(alpha(L)) V, a
+          low-rank correction whose coefficients alpha(L) come from a hypernetwork on the one-hot
+          length. This is a per-length linear mixing across input samples (a length-adapted
+          equalizing filter), which the diagnosis found recovers the clean representation to
+          R^2 >= 0.976 at every length, vs a per-length diagonal (FiLM) collapsing toward 0.64.
+      (2) Wider input context: paired with channel.WindowDeserializer, x already contains the
+          neighbor symbols dispersion leaked energy into, so the mixing has that energy to work
+          with (the center-only receiver never sees it).
+
+    Zero-init: the hypernetwork's output layers start at zero, so alpha(L)=0 and the per-length
+    bias=0 at step 0 -> the model is exactly a plain (unconditioned) wide-context receiver, and can
+    only *add* conditioning as it helps. A per-length hidden bias alone reproduces FiLM-beta, so
+    this receiver's hypothesis class contains beta-only FiLM: it cannot represent a worse function.
+    """
+    def __init__(self, n_input, hidden, n_output, min_length, max_length,
+                 length_encoding='one_hot', length_step=2.0, rank=8, hyper_hidden=None):
+        super().__init__()
+        self.n_input = n_input
+        self.hidden = hidden
+        self.minL = float(min_length)
+        self.maxL = float(max_length)
+        self.length_step = float(length_step)
+        self.length_encoding = str(length_encoding).lower()
+        if self.length_encoding != 'one_hot':
+            raise ValueError("EqualizerReceiver currently supports length_encoding='one_hot' only, "
+                             f"got {length_encoding!r}")
+        if self.length_step <= 0:
+            raise ValueError("length_step must be > 0")
+        self.num_bins = int(math.floor((self.maxL - self.minL) / self.length_step)) + 1
+        self.rank = int(rank)
+
+        # backbone (same shape as the baseline Receiver, but a wider input from the window)
+        self.layer_in = nn.Linear(n_input, hidden)
+        self.layer_1 = nn.Linear(hidden, hidden)
+        self.layer_out = nn.Linear(hidden, n_output)
+        self.act1 = nn.ReLU()
+        self.act2 = nn.ReLU()
+
+        # low-rank basis for the length-conditioned weight correction W(L)=W0 + U diag(alpha) V
+        self.U = nn.Parameter(torch.empty(hidden, self.rank))
+        self.V = nn.Parameter(torch.empty(self.rank, n_input))
+        nn.init.kaiming_uniform_(self.U, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.V, a=math.sqrt(5))
+
+        # hypernetwork: one-hot length -> rank coefficients alpha(L), and -> per-length hidden bias
+        hh = hidden if hyper_hidden is None else int(hyper_hidden)
+        self.hyper = nn.Sequential(nn.Linear(self.num_bins, hh), nn.ReLU(), nn.Linear(hh, self.rank))
+        self.bias_hyper = nn.Linear(self.num_bins, hidden)
+        # zero-init the OUTPUT layers so the correction and bias are exactly 0 at init
+        nn.init.zeros_(self.hyper[-1].weight)
+        nn.init.zeros_(self.hyper[-1].bias)
+        nn.init.zeros_(self.bias_hyper.weight)
+        nn.init.zeros_(self.bias_hyper.bias)
+
+    def _one_hot(self, length, B, device, dtype):
+        if not torch.is_tensor(length):
+            length = torch.tensor(length, device=device, dtype=dtype)
+        else:
+            length = length.to(device=device, dtype=dtype)
+        if length.dim() == 0:
+            length = length.unsqueeze(0).expand(B)
+        elif length.dim() == 1 and length.numel() == 1:
+            length = length.expand(B)
+        length = length.clamp(self.minL, self.maxL)
+        idx = torch.round((length - self.minL) / self.length_step).long().clamp(0, self.num_bins - 1)
+        one_hot = torch.zeros(B, self.num_bins, device=device, dtype=dtype)
+        one_hot.scatter_(1, idx.view(B, 1), 1.0)
+        return one_hot
+
+    def forward(self, x, length):
+        B = x.size(0)
+        one_hot = self._one_hot(length, B, x.device, x.dtype)
+        alpha = self.hyper(one_hot)                    # (B, rank), zero at init
+        Vx = x @ self.V.t()                            # (B, rank)
+        correction = (alpha * Vx) @ self.U.t()         # (B, hidden) == U diag(alpha) V x, per-sample
+        beta = self.bias_hyper(one_hot)                # (B, hidden), zero at init (== FiLM-beta)
+        h = self.layer_in(x) + correction + beta
+        h = self.act1(h)
+        h = self.layer_1(h)
+        h = self.act2(h)
+        return self.layer_out(h)
 
 
 class GaussianEmbedding(nn.Module):

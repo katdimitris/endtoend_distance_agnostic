@@ -10,7 +10,7 @@ from utils import *
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--bits", type=int, default=6)
-parser.add_argument("--n", type=int, default=48)
+parser.add_argument("--n", type=int, default=40)
 parser.add_argument("--exp_dir", type=str, default='hardware_exp_debug_0_55')
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument('--gpu_id', type=int, default=0)
@@ -28,6 +28,15 @@ parser.add_argument("--eval_step", type=int, default=1,
                      help="km spacing of the post-training evaluation sweep over transfer_lengths.")
 parser.add_argument("--no_eval", type=str2bool, default=False,
                      help="skip the post-training evaluation sweep entirely (train-only, faster).")
+parser.add_argument("--resume_from", type=str, default=None,
+                     help="checkpoint dir (as saved by Trainer.save) to load transmitter/channel/"
+                          "receiver weights from before training starts, e.g. for progressively "
+                          "activating more film_layers on top of an already-converged model. "
+                          "Architecture must match except (optionally) film_layers -- all film "
+                          "heads exist regardless of which are active, so activating a previously-"
+                          "inactive one just means it starts from its own original untrained init "
+                          "while the rest of the model resumes already-converged. Optimizer/LR "
+                          "schedule always start fresh over this run's --train_iter budget.")
 
 parser.add_argument("--optimizer", type=str, default='adam')
 parser.add_argument("--scheduler", type=str, default='cosine')
@@ -48,6 +57,31 @@ parser.add_argument('--batch_size', type=int, default=1012) # 2024 1012 506
 parser.add_argument("--film_layers",type=str, default="0", help="receiver FiLM layer indices, e.g. 0,1,2")
 parser.add_argument("--film_mode",type=str, default="both", help="both, gamma, beta")
 parser.add_argument("--mlp_layers",type=int, default=1)
+parser.add_argument("--window_margin", type=int, default=2,
+                     help="for receiver_type=equalizer: number of neighbor symbols on each side of "
+                          "the center the receiver sees (WindowDeserializer). Ignored otherwise.")
+parser.add_argument("--rank", type=int, default=8,
+                     help="for receiver_type=equalizer: rank of the length-conditioned low-rank "
+                          "weight correction on the receiver's first layer. Ignored otherwise.")
+
+ALLOWED_ACTIVATIONS = ('relu', 'sigmoid', 'photonic_sigmoid', 'cliprelu')
+parser.add_argument("--transmitter_activations", type=str, default="relu,relu,sigmoid",
+                     help="comma-separated, exactly 3 values: activation after layer_in, layer_1, "
+                          f"layer_out. Each one of {ALLOWED_ACTIVATIONS}.")
+parser.add_argument("--receiver_activations", type=str, default="relu,relu",
+                     help="comma-separated, exactly 2 values: activation after layer_in, layer_1 "
+                          f"(receiver/FiLMReceiver has no output activation). Each one of {ALLOWED_ACTIVATIONS}.")
+
+
+def parse_activations(s, n, argname):
+    parts = [p.strip().lower() for p in s.split(',')]
+    if len(parts) != n:
+        raise ValueError(f"--{argname} must have exactly {n} comma-separated values, got {len(parts)}: {s!r}")
+    bad = [p for p in parts if p not in ALLOWED_ACTIVATIONS]
+    if bad:
+        raise ValueError(f"--{argname} has invalid activation(s) {bad}; allowed: {ALLOWED_ACTIVATIONS}")
+    return tuple(parts)
+
 
 def build_parameters(args):
     """Everything needed by get_models()/Trainer, built from parsed CLI args.
@@ -82,10 +116,16 @@ def build_parameters(args):
     parameters['film_layers'] = film_layers
     parameters['film_mode'] = args.film_mode
     parameters['mlp_layers'] = args.mlp_layers
+    # window_margin drives BOTH the channel's WindowDeserializer and the equalizer receiver's
+    # input width, so they must agree -- only set it for the equalizer, else None (center-only).
+    parameters['window_margin'] = args.window_margin if args.receiver_type in ('equalizer', 'wide') else None
+    parameters['rank'] = args.rank
     parameters['d'] = args.d
     parameters['sigma'] = args.sigma
     parameters['step'] = args.step
     parameters['transmitter_type'] = args.transmitter_type
+    parameters['transmitter_activations'] = parse_activations(args.transmitter_activations, 3, 'transmitter_activations')
+    parameters['receiver_activations'] = parse_activations(args.receiver_activations, 2, 'receiver_activations')
     return parameters
 
 
@@ -103,6 +143,10 @@ def build_exp_identifiers(args, parameters):
     elif 'film' in parameters['receiver_type']:
         method_str = 'film'
         method_str += f'_{args.length_encoding}_mode={args.film_mode}_mlp={args.mlp_layers}_pos={args.position}_l={film_layers}'
+    elif parameters['receiver_type'] == 'equalizer':
+        method_str = f'equalizer_{args.length_encoding}_margin={args.window_margin}_rank={args.rank}'
+    elif parameters['receiver_type'] == 'wide':
+        method_str = f'wide_margin={args.window_margin}'
     else:
         method_str = 'baseline'
 
@@ -118,6 +162,9 @@ def build_exp_identifiers(args, parameters):
             method_str += f'_transm_film_{args.length_encoding}_mode={args.film_mode}_mlp={args.mlp_layers}_pos={args.position}_l={film_layers}'
     if args.train_km_list:
         method_str += '_trainkms=' + '-'.join(str(k) for k in args.train_km_list)
+    if args.resume_from:
+        # so a resumed run never collides with a from-scratch run of the same film_layers
+        method_str += '_resumed'
 
     exp_dir = f'{args.exp_dir}_train={args.train_lengths}_eval={args.transfer_lengths}/'
     exp_name = f'{method_str}_it={args.train_iter}_vs={args.val_size}_opt={args.optimizer}_lr={args.lr}_bs={args.batch_size}_s={args.seed}'
@@ -126,11 +173,18 @@ def build_exp_identifiers(args, parameters):
 
 def main():
     parameters = build_parameters(args)
+    parameters['resumed_from'] = args.resume_from
     exp_dir, exp_name = build_exp_identifiers(args, parameters)
 
     writer = SummaryWriter(f'hardware_exps_v2/{exp_dir}/{exp_name}')
 
     models = get_models(parameters)
+    if args.resume_from:
+        print(f"Resuming weights from {args.resume_from}")
+        for name, model in models.items():
+            state = T.load(f'{args.resume_from}/{name}.pt', map_location=parameters['device'], weights_only=True)
+            model.load_state_dict(state)
+
     trainer = Trainer(models, parameters, writer, exp_dir, exp_name)
     trainer.run()
     trainer.save()
