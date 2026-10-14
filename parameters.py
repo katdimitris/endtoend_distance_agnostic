@@ -25,6 +25,8 @@ def get_channel(parameters):
         full_output=parameters.get('full_eval', False),
         sliding=parameters.get('sliding_eval', False),
         window_margin=parameters.get('window_margin', None),
+        # checkpoints saved before std_interp existed were trained with the single LSQ fit
+        std_interp=parameters.get('std_interp', 'loglinear_fit'),
     )
     return channel
 
@@ -96,10 +98,18 @@ def get_channel_parameters(initializer=None):
     )  # Cutoff frequency as a fraction of the sampling rate
     # AWGN std, calibrated per fiber length; interpolated/extrapolated at forward time based on
     # the current length (see AWGN_STD_v3 in channel.py)
+    # Previous table (used by every run up to range_10_60_n40 / range_20_60_n40 and by
+    # pretrained/10-60km, pretrained/20-60km),
+    # with the single least-squares log-linear fit ('loglinear_fit'):
+    # parameters['std_km_table'] = (
+    #     (20, 0.0248), (30, 0.03126), (40, 0.03936), (50, 0.04955),
+    #     (60, 0.06238), (70, 0.07853), (80, 0.09886),
+    # )
     parameters['std_km_table'] = (
-        (20, 0.0248), (30, 0.03126), (40, 0.03936), (50, 0.04955),
-        (60, 0.06238), (70, 0.07853), (80, 0.09886),
+        (25, 0.0273), (29, 0.0329), (36, 0.0476), (40, 0.0554), (47, 0.1058),
     )
+    # exact through every measured point, extended by the end segments outside 25-47km
+    parameters['std_interp'] = 'piecewise_loglinear'
     parameters['ER'] = 20
     parameters['d_ps_nm_km'] = 17.0
     parameters['reference_wavelength_nm'] = 1550.0

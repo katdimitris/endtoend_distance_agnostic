@@ -39,10 +39,11 @@ class Channel_v3(T.nn.Module):
                              # gets real neighbors instead of a fake zero-padded edge. Takes
                              # precedence over full_output -- every window already has a
                              # single well-defined center, decoding "all of it" doesn't apply.
-            window_margin=None):  # if set (int), deserialize a window of the center symbol plus
-                                   # this many neighbor symbols on each side (see WindowDeserializer)
-                                   # instead of the center alone -- gives the receiver the neighbor
-                                   # samples that dispersion ISI leaks a symbol's energy into.
+            window_margin=None,  # if set (int), deserialize a window of the center symbol plus
+                                  # this many neighbor symbols on each side (see WindowDeserializer)
+                                  # instead of the center alone -- gives the receiver the neighbor
+                                  # samples that dispersion ISI leaks a symbol's energy into.
+            std_interp='loglinear_fit'):  # how AWGN_STD_v3 turns std_km_table into std(km)
 
         super().__init__()
 
@@ -81,7 +82,7 @@ class Channel_v3(T.nn.Module):
 
         self.lpf = LPFv3_Sync(fc, band_fact, normalize=True, dtype=dtype)
         self.mzm = MZMv3(ER, normalize=True, dtype=dtype)
-        self.awgn_std = AWGN_STD_v3(std_km_table, normalize=True, dtype=dtype)
+        self.awgn_std = AWGN_STD_v3(std_km_table, normalize=True, dtype=dtype, interp=std_interp)
         self.awgn_snr = AWGN_SNR_v3(snr, normalize=True, dtype=dtype)
         self.dispersion = Dispersion_v3(sample_rate, d_ps_nm_km,
                                         reference_wavelength_nm, length_km,
@@ -189,19 +190,44 @@ class MZMv3(T.nn.Module):
 
 
 class AWGN_STD_v3(T.nn.Module):
-    def __init__(self, std_km_table, normalize=False, dtype=T.double):
+    def __init__(self, std_km_table, normalize=False, dtype=T.double, interp='loglinear_fit'):
         super().__init__()
         self.normalize = normalize
         self.dtype = dtype
         self.cur_length = None
+        self.interp = interp
 
-        # AWGN std grows with fiber length (ASE-noise-style). Fit log10(std) = a + b*km
-        # to the calibrated (km, std) table so it can be evaluated at any length, not just
-        # the tabulated ones -- same idea as Dispersion_v3 evaluating its phase from length.
+        # AWGN std grows with fiber length (ASE-noise-style), so it is modeled in log10(std) and
+        # evaluated at any length, not just the tabulated ones -- same idea as Dispersion_v3
+        # evaluating its phase from length. Three modes:
+        #   'loglinear_fit' (default, kept so older checkpoints rebuild the exact same channel):
+        #       ONE least-squares line log10(std) = a + b*km through the whole table. Fine for a
+        #       table that is itself exponential, but it does NOT pass through the measured points.
+        #   'piecewise_loglinear': passes EXACTLY through every measured (km, std) point, linear in
+        #       log10(std) between neighbors; below the first / above the last point it extends the
+        #       first / last segment, so any training range (e.g. 10-50 for a 25-47 table) is covered.
+        #   'constant': the same std at every length (table must hold a single std value) -- removes
+        #       the length dependence of the noise, leaving dispersion as the only length effect.
         kms, stds = zip(*std_km_table)
-        b, a = np.polyfit(np.array(kms, dtype=np.float64), np.log10(np.array(stds, dtype=np.float64)), 1)
-        self.log_std_a = float(a)
-        self.log_std_b = float(b)
+        kms = np.array(kms, dtype=np.float64)
+        log_stds = np.log10(np.array(stds, dtype=np.float64))
+        if interp == 'constant':
+            if len(set(stds)) != 1:
+                raise ValueError(f"constant std interp needs a single std value, got {std_km_table}")
+            self.const_std = float(stds[0])
+        elif interp == 'loglinear_fit':
+            b, a = np.polyfit(kms, log_stds, 1)
+            self.log_std_a = float(a)
+            self.log_std_b = float(b)
+        elif interp == 'piecewise_loglinear':
+            order = np.argsort(kms)
+            if len(kms) < 2 or np.any(np.diff(kms[order]) <= 0):
+                raise ValueError(f"piecewise_loglinear needs >= 2 distinct km points, got {std_km_table}")
+            self.table_kms = T.tensor(kms[order], dtype=T.float64)
+            self.table_log_stds = T.tensor(log_stds[order], dtype=T.float64)
+        else:
+            raise ValueError(f"Unsupported std interp {interp!r} "
+                              f"(expected 'loglinear_fit', 'piecewise_loglinear' or 'constant')")
 
     def set_length(self, length):
         self.cur_length = length
@@ -210,7 +236,22 @@ class AWGN_STD_v3(T.nn.Module):
         return self.cur_length
 
     def get_std(self):
-        return 10.0 ** (self.log_std_a + self.log_std_b * self.cur_length)
+        if self.interp == 'constant':
+            return self.const_std
+        if self.interp == 'loglinear_fit':
+            return 10.0 ** (self.log_std_a + self.log_std_b * self.cur_length)
+
+        is_tensor = T.is_tensor(self.cur_length)
+        length = self.cur_length if is_tensor else T.tensor(float(self.cur_length), dtype=T.float64)
+        kms = self.table_kms.to(device=length.device, dtype=length.dtype)
+        log_stds = self.table_log_stds.to(device=length.device, dtype=length.dtype)
+        # segment i spans kms[i]..kms[i+1]; searching only the interior breakpoints sends lengths
+        # below kms[0] to segment 0 and above kms[-1] to the last segment (end-segment extrapolation)
+        seg = T.searchsorted(kms[1:-1].contiguous(), length.contiguous(), right=True)
+        x0, x1 = kms[seg], kms[seg + 1]
+        y0, y1 = log_stds[seg], log_stds[seg + 1]
+        std = 10.0 ** (y0 + (length - x0) * (y1 - y0) / (x1 - x0))
+        return std if is_tensor else float(std)
 
     def forward(self, x):
         std = self.get_std()
