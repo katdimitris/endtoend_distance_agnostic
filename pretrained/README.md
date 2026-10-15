@@ -2,7 +2,7 @@
 
 Best-seed (lowest mean BLER over its km sweep, out of 5 seeds) checkpoints for the
 `non_photonic_activations_sigmoid` activation profile (relu everywhere, sigmoid transmitter
-output), n=40, in four sets:
+output), n=40, in five sets:
 
 | Set | Train/eval range | AWGN noise model |
 |---|---|---|
@@ -10,6 +10,7 @@ output), n=40, in four sets:
 | `20-60km` | 20-60 km | previous σ table (20-80 km), single least-squares log-linear fit |
 | `20-50km-sigmav2` | 20-50 km | measured σ table, exact piecewise log-linear interpolation (below) |
 | `20-50km-fixedsigma` | 20-50 km | constant σ = 0.015 at every length (noise does not grow with km) |
+| `10-60km-new` | 10-60 km | constant σ = 0.015 at every length (same noise model as `20-50km-fixedsigma`) |
 
 Measured σ table used by `20-50km-sigmav2`: km [25, 29, 36, 40, 47] → σ [0.0273, 0.0329, 0.0476,
 0.0554, 0.1058], interpolated linearly in log10(σ) between points and extended by the end segments
@@ -24,7 +25,7 @@ Four methods per set:
 | `proposed_receiver_only` | Scalar length encoding, gamma-only FiLM receiver, mlp=2, preact |
 | `proposed_receiver_transmitter` | Same as above, FiLM applied to receiver AND transmitter |
 
-All four sets use the identical configuration for each method (same flags, 20k iterations, CE
+All sets use the identical configuration for each method (same flags, 20k iterations, CE
 loss); only the range and the noise model differ.
 
 Seed picked per method:
@@ -35,6 +36,7 @@ Seed picked per method:
 | `20-60km` | 4 | 1 | 2 | 1 |
 | `20-50km-sigmav2` | 1 | 0 | 1 | 1 |
 | `20-50km-fixedsigma` | 2 | 1 | 0 | 4 |
+| `10-60km-new` | 3 | 1 | 2 | 3 |
 
 Each checkpoint folder contains `transmitter.pt`, `channel.pt`, `receiver.pt`, `parameters.pt`,
 `parameters.json`. `parameters.pt` is the source of truth for reconstructing the exact model
@@ -54,8 +56,8 @@ python inference.py --gpu_id 0 \
   --output_csv eval_out.csv
 ```
 
-Swap `--checkpoint_dir` for any of the 16 folders (`pretrained/{10-60km,20-60km,20-50km-sigmav2,
-20-50km-fixedsigma}/{unconditioned,karanov_baseline,proposed_receiver_only,
+Swap `--checkpoint_dir` for any of the 20 folders (`pretrained/{10-60km,20-60km,20-50km-sigmav2,
+20-50km-fixedsigma,10-60km-new}/{unconditioned,karanov_baseline,proposed_receiver_only,
 proposed_receiver_transmitter}`). `--eval_kms` should stay within the folder's training range
 (10-60, 20-60 or 20-50) for meaningful results.
 
@@ -65,4 +67,4 @@ proposed_receiver_transmitter}`). `--eval_kms` should stay within the folder's t
 plots (across all 4 methods) for every set, under this same activation profile. Evaluation: every
 2 km over the training range, val_size=1,000,000. Seeds whose mean BLER over the sweep marks them
 as never having trained are left out of the average and named in its legend (Karanov seed 4 in both
-20-50km sets).
+20-50km sets, Karanov seed 3 in `10-60km-new`).
