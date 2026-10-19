@@ -41,6 +41,22 @@ parser.add_argument("--resume_from", type=str, default=None,
 parser.add_argument("--optimizer", type=str, default='adam')
 parser.add_argument("--scheduler", type=str, default='cosine')
 parser.add_argument("--lr", type=float, default=0.0005)
+parser.add_argument("--loss", type=str, default='ce', choices=['ce', 'focal'],
+                     help="training loss: 'ce' (cross-entropy, default) or 'focal' (utils.FocalLoss, "
+                          "down-weights confidently-decoded samples so the hard long-km ones dominate).")
+parser.add_argument("--focal_gamma", type=float, default=2.0,
+                     help="focusing exponent for --loss focal (0 == plain CE). Ignored for --loss ce.")
+parser.add_argument("--fixed_sigma", type=float, default=None,
+                     help="if set, the AWGN std is this constant at EVERY length instead of the per-km "
+                          "std_km_table interpolation (parameters.py) -- noise no longer grows with km.")
+parser.add_argument("--sigma_scale", type=float, default=None,
+                    help="multiply every AWGN std in std_km_table by this factor (e.g. 1.5 = +50%%); with the "
+                         "log-linear interpolation this scales the whole std(km) curve, extrapolation included.")
+parser.add_argument("--er", type=float, default=None,
+                    help="modulator extinction ratio in dB (default: parameters.py, 20). Applied to the field "
+                         "min-max range, like the default.")
+parser.add_argument("--snr", type=float, default=None,
+                    help="DAC/ADC quantization-noise SNR in dB (default: parameters.py, 38).")
 
 parser.add_argument("--receiver_type", type=str, default='baseline')
 parser.add_argument("--transmitter_type", type=str, default='baseline')
@@ -54,6 +70,7 @@ parser.add_argument("--val_iter", type=int, default=1) # 100
 parser.add_argument("--train_size", type=int, default=10000000)  # 253000 506000 Papers: 250 * 1e5 25300 25000000 1012000
 parser.add_argument("--val_size", type=int, default=616000)  #  154000 616000
 parser.add_argument('--batch_size', type=int, default=1012) # 2024 1012 506
+parser.add_argument('--num_workers', type=int, default=0, help='DataLoader workers for the training loader (0 = in-process)')
 parser.add_argument("--film_layers",type=str, default="0", help="receiver FiLM layer indices, e.g. 0,1,2")
 parser.add_argument("--film_mode",type=str, default="both", help="both, gamma, beta")
 parser.add_argument("--mlp_layers",type=int, default=1)
@@ -102,7 +119,19 @@ def build_parameters(args):
     parameters['val_size'] = args.val_size
     parameters['val_iter'] = args.val_iter
     parameters['lr'] = args.lr
+    parameters['loss'] = args.loss
+    parameters['focal_gamma'] = args.focal_gamma if args.loss == 'focal' else None
+    if args.fixed_sigma is not None:
+        parameters['std_km_table'] = ((0, args.fixed_sigma),)  # km is irrelevant for 'constant'
+        parameters['std_interp'] = 'constant'
+    if args.sigma_scale is not None:
+        parameters['std_km_table'] = tuple((km, std * args.sigma_scale) for km, std in parameters['std_km_table'])
+    if args.er is not None:
+        parameters['ER'] = args.er
+    if args.snr is not None:
+        parameters['snr'] = args.snr
     parameters['batch'] = args.batch_size
+    parameters['num_workers'] = args.num_workers
     parameters['optimizer'] = args.optimizer
     parameters['receiver_type'] = args.receiver_type
     parameters['train_lengths'] = args.train_lengths
@@ -162,6 +191,17 @@ def build_exp_identifiers(args, parameters):
             method_str += f'_transm_film_{args.length_encoding}_mode={args.film_mode}_mlp={args.mlp_layers}_pos={args.position}_l={film_layers}'
     if args.train_km_list:
         method_str += '_trainkms=' + '-'.join(str(k) for k in args.train_km_list)
+    if args.loss != 'ce':
+        # CE runs keep their historical names; any other loss must never overwrite them
+        method_str += f'_loss={args.loss}_g={args.focal_gamma}'
+    if args.fixed_sigma is not None:
+        method_str += f'_sigma={args.fixed_sigma}'
+    if args.sigma_scale is not None:
+        method_str += f'_sigmascale={args.sigma_scale}'
+    if args.er is not None:
+        method_str += f'_ER={args.er}'
+    if args.snr is not None:
+        method_str += f'_snr={args.snr}'
     if args.resume_from:
         # so a resumed run never collides with a from-scratch run of the same film_layers
         method_str += '_resumed'

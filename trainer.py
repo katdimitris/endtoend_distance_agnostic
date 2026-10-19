@@ -6,7 +6,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 from utils import get_random_ds
-from utils import ErrorCounter, OneHotToInt
+from utils import ErrorCounter, OneHotToInt, FocalLoss
 from utils import *
 
 class Trainer():
@@ -27,13 +27,15 @@ class Trainer():
                                     N_symbols=parameters['N'],
                                     device=self.device,
                                     batch_size=parameters['batch'],
-                                    dtype=T.float)
+                                    dtype=T.float,
+                                    num_workers=parameters.get('num_workers', 0))
         self.eval_loader = get_random_ds(size=parameters['val_size'],
                                     max_num=parameters['M'],
                                     N_symbols=parameters['N'],
                                     device=self.device,
                                     batch_size=parameters['batch'],
-                                    dtype=T.float)
+                                    dtype=T.float,
+                                    num_workers=parameters.get('num_workers', 0))
 
         self.train_iter = parameters['train_iter']
         self.effective_bs = parameters['batch'] // parameters['N']
@@ -62,7 +64,12 @@ class Trainer():
             self.optimizer = T.optim.Adam(params, lr=parameters['lr'])
     
         self.scheduler = T.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=parameters['train_iter'])
-        self.criterion = nn.CrossEntropyLoss()
+        # .get() default: parameters saved before --loss existed were all trained with CE
+        self.loss_name = parameters.get('loss', 'ce')
+        if self.loss_name == 'focal':
+            self.criterion = FocalLoss(gamma=parameters['focal_gamma'])
+        else:
+            self.criterion = nn.CrossEntropyLoss()
 
         self.error_counter = ErrorCounter(parameters['bits'])
         self.onehot_to_int = OneHotToInt()
@@ -105,7 +112,8 @@ class Trainer():
             bits_counter += bits
             if step % self.parameters['log_interval'] == 0 and self.parameters['logging']:
                 self.writer.add_scalar(f'Train/LR', self.optimizer.param_groups[0]['lr'], step)
-                self.writer.add_scalar(f'Train/CE Loss', loss_meter.avg, step)
+                loss_tag = 'CE Loss' if self.loss_name == 'ce' else 'Focal Loss'
+                self.writer.add_scalar(f'Train/{loss_tag}', loss_meter.avg, step)
                 self.writer.add_scalar(f'Train/BLER', errors.astype(np.float64) / float(bits_counter), step)
                 loss_meter = AverageMeter()
                 errors, bits_counter = 0, 0

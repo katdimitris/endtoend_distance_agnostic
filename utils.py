@@ -62,6 +62,22 @@ class AverageMeter(object):
        self.avg = self.sum / self.count
 
 
+class FocalLoss(T.nn.Module):
+    """Multi-class focal loss (Lin et al. 2017): mean of -(1 - p_t)^gamma * log(p_t) over the batch,
+    p_t = softmax probability of the true class. Down-weights samples the model already decodes
+    confidently, so within a mixed-length batch the gradient shifts toward the hard (long-km, high
+    noise) samples. gamma=0 is exactly CrossEntropyLoss. Takes raw logits + int targets, like CE."""
+    def __init__(self, gamma=2.0):
+        super().__init__()
+        self.gamma = float(gamma)
+
+    def forward(self, logits, targets):
+        log_p = T.nn.functional.log_softmax(logits, dim=1)
+        log_p_t = log_p.gather(1, targets.long().view(-1, 1)).squeeze(1)
+        p_t = log_p_t.exp()
+        return (-(1.0 - p_t) ** self.gamma * log_p_t).mean()
+
+
 def get_closest_tag(var_length, parameters=None):
     if parameters['tags_encoding'] == 'one_hot':
         tags = np.arange(parameters['train_lengths'][0],
@@ -329,7 +345,8 @@ class RandomDataset(Dataset):
         return self.data
 
 
-def get_random_ds(size, max_num, N_symbols, device, batch_size=64, dtype=T.double, full_targets=False):
+def get_random_ds(size, max_num, N_symbols, device, batch_size=64, dtype=T.double, full_targets=False,
+                  num_workers=0):
     if batch_size % N_symbols != 0:
         # custom_collate_fn's center-target selection (and inference.py's per-position
         # full-mode tracking) both assume every batch starts exactly at a group boundary.
@@ -340,11 +357,15 @@ def get_random_ds(size, max_num, N_symbols, device, batch_size=64, dtype=T.doubl
         raise ValueError(f"batch_size ({batch_size}) must be a multiple of N_symbols ({N_symbols}) "
                           f"-- otherwise which position within each group is 'center' silently "
                           f"drifts from batch to batch instead of staying fixed.")
+    # with worker processes the dataset must live on the CPU (CUDA tensors cannot be used in forked workers);
+    # the labels and their order are identical either way
     return DataLoader(
-        RandomDataset(max_num, N_symbols, device, size, dtype, full_targets=full_targets),
+        RandomDataset(max_num, N_symbols, 'cpu' if num_workers > 0 else device, size, dtype, full_targets=full_targets),
         batch_size,
         collate_fn=lambda data: custom_collate_fn(data, N_symbols, full_targets=full_targets),
         shuffle=False,
-        num_workers=0,
+        num_workers=num_workers,
+        # NOT persistent: a fresh iterator per pass draws one number from the main CPU RNG (as with 0 workers), so the
+        # CPU-generated channel noise stays bit-identical to num_workers=0 runs across loader restarts
         pin_memory=True,
         drop_last=True)

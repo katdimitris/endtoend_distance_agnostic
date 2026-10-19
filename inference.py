@@ -1,5 +1,6 @@
 
 import os
+import sys
 
 import numpy as np
 import torch as T
@@ -168,7 +169,12 @@ def main():
     parameters = T.load(os.path.join(checkpoint_dir, 'parameters.pt'), weights_only=False)
     parameters['device'] = T.device(f"cuda:{args.gpu_id}" if T.cuda.is_available() else "cpu")
     parameters['val_size'] = args.val_size
-    parameters['batch'] = args.batch_size
+    # the MZM min-max uses whole-batch statistics, so evaluate with the batch the model was trained with: a checkpoint
+    # may store it as 'eval_batch' (imported eakirtas models: 253); an explicit --batch_size always wins
+    if '--batch_size' not in sys.argv and 'eval_batch' in parameters:
+        parameters['batch'] = parameters['eval_batch']
+    else:
+        parameters['batch'] = args.batch_size
     parameters['full_eval'] = (args.eval_mode == 'full')
     parameters['sliding_eval'] = (args.eval_mode == 'sliding')
 
@@ -181,7 +187,7 @@ def main():
         loader = get_random_ds(size=parameters['val_size'], max_num=parameters['M'],
                                 N_symbols=parameters['N'], device=parameters['device'],
                                 batch_size=parameters['batch'], dtype=T.float,
-                                full_targets=parameters['full_eval'])
+                                full_targets=parameters['full_eval'], num_workers=args.num_workers)
 
     rows = []
     print(f"{'km':>6}  {'BLER':>12}  {'CE Loss':>12}")

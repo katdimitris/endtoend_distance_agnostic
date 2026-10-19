@@ -35,8 +35,10 @@ def get_transmitter(parameters):
     # .get() defaults keep old checkpoints (saved before --transmitter_activations existed)
     # loadable: they get today's previous hardcoded behavior (relu, relu, sigmoid).
     tx_activations = parameters.get('transmitter_activations', ('relu', 'relu', 'sigmoid'))
+    # hidden width defaults to M (64); checkpoints imported from eakirtas/endtoend_plain set tx_hidden=2M (128)
+    tx_hidden = parameters.get('tx_hidden', parameters['M'])
     if parameters['transmitter_type'] == 'baseline':
-        transmitter = Transimitter(n_input=parameters['M']+n_tags, hidden=parameters['M'], n_output=parameters['n'],
+        transmitter = Transimitter(n_input=parameters['M']+n_tags, hidden=tx_hidden, n_output=parameters['n'],
                                    activations=tx_activations, parameters=parameters)
     elif parameters['transmitter_type'] == 'film':
         transmitter = FiLMTransimitter(n_input=parameters['M']+n_tags, hidden=parameters['M'], n_output=parameters['n'],
