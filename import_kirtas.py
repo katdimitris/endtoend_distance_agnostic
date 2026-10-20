@@ -30,6 +30,7 @@ ap.add_argument('--activations', choices=['photonic', 'nonphotonic'], default='p
                      "nonphotonic: Tx relu,relu,sigmoid / Rx relu,relu (this repo's profile)")
 ap.add_argument('--sigma', type=float, required=True, help='constant AWGN std the model was trained with')
 ap.add_argument('--km', type=float, required=True, help='fibre length the model was trained at')
+ap.add_argument('--er', type=float, default=None, help='modulator extinction ratio in dB, if not the default 20')
 ap.add_argument('--n', type=int, default=40)
 ap.add_argument('--batch', type=int, default=253, help='their training batch in messages (23 sequences of 11)')
 ap.add_argument('--steps', type=int, default=20000, help='optimisation steps the model was trained for (recorded only)')
@@ -43,7 +44,7 @@ sys.argv = ['train.py', '--n', str(a.n), '--bits', '6', '--seed', str(a.seed), '
             '--lr', '0.0005', '--train_iter', str(a.steps), '--fixed_sigma', str(a.sigma),
             '--train_lengths', f'{km},{km}', '--transfer_lengths', f'{km},{km}',
             '--receiver_type', 'baseline', '--transmitter_type', 'baseline',
-            '--transmitter_activations', tx_act, '--receiver_activations', rx_act]
+            '--transmitter_activations', tx_act, '--receiver_activations', rx_act] + (['--er', str(a.er)] if a.er is not None else [])
 from train import parser, build_parameters   # noqa: E402  (after sys.argv is set)
 from parameters import get_models            # noqa: E402
 

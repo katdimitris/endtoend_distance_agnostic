@@ -31,6 +31,7 @@ only the networks and the training procedure differ from the models trained here
 | `sigma-0.025-ER-13.1` | this repo | relu, relu, sigmoid | relu, relu | 64 | 1012 | 1e-3, cosine | **13.1** / 38 |
 | `sigma-0.025-SNR-22.7` | this repo | relu, relu, sigmoid | relu, relu | 64 | 1012 | 1e-3, cosine | 20 / **22.7** |
 | `sigma-0.025-kirtas-photonic` | eakirtas | **photonic sigmoid** ×3 | **photonic sigmoid** ×2 | 128 | 253 | 5e-4 → 2e-7, step | 20 / 38 |
+| `sigma-0.025-kirtas-photonic-ER-13.1` | eakirtas | **photonic sigmoid** ×3 | **photonic sigmoid** ×2 | 128 | 253 | 5e-4 → 2e-7, step | **13.1** / 38 |
 | `sigma-0.025-kirtas-non-photonic` | eakirtas | relu, relu, sigmoid | relu, relu | 128 | 253 | 5e-4 → 2e-7, step | 20 / 38 |
 
 - **eakirtas training:** 1,000 epochs × 20 batches of 253 messages (23 sequences), freshly drawn every epoch. The
@@ -52,6 +53,7 @@ only the networks and the training procedure differ from the models trained here
 | `sigma-0.025-ER-13.1` | 2.6e-6 (2.3M messages) | – |
 | `sigma-0.025-SNR-22.7` | BER 8.1e-2 | – |
 | `sigma-0.025-kirtas-photonic` | 7.8e-6 (2.3M messages) | 84% |
+| `sigma-0.025-kirtas-photonic-ER-13.1` | 4.3e-6 (2.3M messages) | 84% |
 | `sigma-0.025-kirtas-non-photonic` | 4.9e-4 (2.3M messages) | 29% |
 
 "At the rails" = within 0.1 of the lowest or highest value the output activation can produce.
