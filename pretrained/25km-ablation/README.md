@@ -38,8 +38,10 @@ only the networks and the training procedure differ from the models trained here
   learning rate steps down every 100 epochs (5e-4, 2e-4, 1e-4, 5e-5, 2e-5, 1e-5, 5e-6, 2e-6, 1e-6, 2e-7) and Adam
   is re-created at every epoch. The weights were converted with `import_kirtas.py`.
 - **This repo's training:** 20,000 steps of 1012 messages (92 sequences), Adam with a cosine schedule.
-- **Photonic sigmoid:** output 0.06 to 1.005, about 30× steeper than a standard sigmoid. It drives the transmitter
-  towards a nearly two-level waveform.
+- **Photonic sigmoid:** output 0.06 to 1.005, about 30× steeper than a standard sigmoid. The transmitter's raw
+  samples are mostly at the rails, but they alternate faster than the 32 GHz transmitter filter passes: after the
+  filter (the signal that drives the modulator) only about 11% of the drive is at the rails, so it is not a
+  two-level signal.
 - **Evaluation batch:** the modulator's min-max scaling uses whole-batch statistics, so the `kirtas` checkpoints
   store `eval_batch = 253` and `inference.py` uses it (an explicit `--batch_size` overrides it).
 
@@ -56,7 +58,8 @@ only the networks and the training procedure differ from the models trained here
 | `sigma-0.025-kirtas-photonic-ER-13.1` | 4.3e-6 (2.3M messages) | 84% |
 | `sigma-0.025-kirtas-non-photonic` | 4.9e-4 (2.3M messages) | 29% |
 
-"At the rails" = within 0.1 of the lowest or highest value the output activation can produce.
+"At the rails" = raw transmitter output within 0.1 of the lowest or highest value the output activation can produce
+(before the 32 GHz transmitter filter).
 
 ## Loading
 
